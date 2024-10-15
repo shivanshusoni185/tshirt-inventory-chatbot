@@ -14,7 +14,7 @@ app = Flask(__name__)
 load_dotenv()
 
 # Configuration from environment variables
-GOOGLE_API_KEY = "AIzaSyAuqEIFpOk2Tm2_64S94D2BkWlqNYZ0CQs"
+GOOGLE_API_KEY = "********************************"
 DB_USER = os.getenv('DB_USER')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
 DB_HOST = os.getenv('DB_HOST')
