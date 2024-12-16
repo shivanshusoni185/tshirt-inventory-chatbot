@@ -30,20 +30,31 @@ except Exception as e:
     print(f"Error initializing Google Generative AI model: {str(e)}")
     llm = None
 
-# Custom prompt template for SQL query generation
-# Custom prompt template for SQL query generation
+# Prompt templates
+history_check_prompt = PromptTemplate.from_template(
+    "Given the following conversation history and a new question, determine if the question can be answered using the information in the history. If so, provide the answer. If not, respond with 'NEED_QUERY'.\n\n"
+    "Conversation history:\n{history}\n\n"
+    "New question: {question}\n\n"
+    "Can this be answered from the history? If yes, provide the answer. If no, just respond with 'NEED_QUERY'."
+)
+
 sql_prompt_template = """
-Given an input question, create a syntactically correct MySQL query to run. Do not include any markdown formatting or backticks in your response. Only provide the raw SQL query.
+Create a MySQL query for the following question. Provide only the raw SQL query without formatting:
+Question: {input}
 
-Here is the question: {input}
-
-Given the following database schema:
+Schema:
 {table_info}
 
-Please write a SQL query to answer the question. If you need to, you can use the top {top_k} most similar tables:
+Relevant tables (top {top_k}):
 {table_names}
-
 """
+
+response_prompt = PromptTemplate.from_template(
+    "SQL query: {query}\n"
+    "Result: {result}\n"
+    "Context: {history}\n"
+    "Answer the question concisely: {question}"
+)
 
 # Create SQL query chain
 try:
@@ -59,6 +70,23 @@ except Exception as e:
     print(f"Error creating SQL query chain: {str(e)}")
     sql_chain = None
 
+# Function definitions
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def check_history_for_answer(question, history):
+    """
+    Check if the question can be answered from the conversation history.
+    
+    Args:
+    question (str): The user's input question.
+    history (str): The conversation history.
+    
+    Returns:
+    str: The answer from history or 'NEED_QUERY' if a new query is needed.
+    """
+    history_check_chain = LLMChain(llm=llm, prompt=history_check_prompt, verbose=True)
+    return history_check_chain.run(question=question, history=history)
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def generate_sql_query(question):
     """
@@ -68,7 +96,7 @@ def generate_sql_query(question):
     question (str): The input question.
     
     Returns:
-    str: The generated SQL query.
+    str: The generated SQL query or None if an error occurs.
     """
     if sql_chain is None:
         print("SQL query chain is not initialized.")
@@ -76,28 +104,15 @@ def generate_sql_query(question):
     
     try:
         return sql_chain.invoke({
-            "input": question,  # Changed from "question" to "input"
+            "question": question,  # Changed from "input" to "question"
             "top_k": 5,
             "table_info": db.get_table_info(),
             "table_names": ", ".join(db.get_usable_table_names())
         })
     except Exception as e:
         print(f"Error generating SQL query: {str(e)}")
-        print(f"Question: {question}")
-        print(f"Table info: {db.get_table_info()}")
-        print(f"Table names: {db.get_usable_table_names()}")
         traceback.print_exc()
         return None
-
-
-
-class SQLOutputParser(BaseOutputParser):
-    """Custom output parser for SQL queries."""
-    def parse(self, text):
-        """Parse the output text."""
-        return text
-
-
 
 def clean_sql_query(query):
     """
@@ -117,36 +132,6 @@ def clean_sql_query(query):
     return cleaned_query.strip()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def generate_sql_query(question):
-    """
-    Generate an SQL query based on the given question.
-    
-    Args:
-    question (str): The input question.
-    
-    Returns:
-    str: The generated SQL query.
-    """
-    if sql_chain is None:
-        print("SQL query chain is not initialized.")
-        return None
-    
-    try:
-        return sql_chain.invoke({
-            "question": question,
-            "top_k": 5,
-            "table_info": db.get_table_info(),
-            "table_names": ", ".join(db.get_usable_table_names())
-        })
-    except Exception as e:
-        print(f"Error generating SQL query: {str(e)}")
-        print(f"Question: {question}")
-        print(f"Table info: {db.get_table_info()}")
-        print(f"Table names: {db.get_usable_table_names()}")
-        traceback.print_exc()
-        return None
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def generate_response(query, result, question, history):
     """
     Generate a natural language response based on the SQL query, its result, and conversation history.
@@ -160,13 +145,7 @@ def generate_response(query, result, question, history):
     Returns:
     str: The generated natural language response.
     """
-    response_prompt = PromptTemplate.from_template(
-        "Based on the SQL query: {query}\n"
-        "And its result: {result}\n"
-        "Previous conversation:\n{history}\n"
-        "Please provide a natural language answer to the question: {question}"
-    )
-    response_chain = LLMChain(llm=llm, prompt=response_prompt,verbose=True)
+    response_chain = LLMChain(llm=llm, prompt=response_prompt, verbose=True)
     return response_chain.run(query=query, result=result, question=question, history=history)
 
 def get_response(question, memory):
@@ -183,38 +162,34 @@ def get_response(question, memory):
     history = memory.load_memory_variables({})["history"]
     
     try:
-        if llm is None or sql_chain is None:
-            return "I'm sorry, but I'm currently unable to process your request due to a configuration issue. Please try again later or contact support."
-
-        print(f"Generating SQL query for question: {question}")  # Debug print
+        # First, check if the question can be answered from history
+        history_response = check_history_for_answer(question, history)
         
-        # Generate SQL query with retry
+        if history_response != "NEED_QUERY":
+            # The question was answered from history
+            memory.save_context({"input": question}, {"output": history_response})
+            return history_response
+
+        # If we need a new query, proceed with the existing flow
+        if llm is None or sql_chain is None:
+            return "Sorry, I can't process your request due to a configuration issue. Please try again later or contact support."
+
         sql_query = generate_sql_query(question)
         
         if sql_query is None:
-            return "I'm sorry, but I couldn't generate a valid SQL query for your question. Could you please rephrase or ask a different question?"
+            return "I couldn't generate a valid SQL query. Could you rephrase your question?"
 
-        # Clean the SQL query
         cleaned_sql_query = clean_sql_query(sql_query)
-        
-        print(f"Generated SQL query: {cleaned_sql_query}")  # Debug print
-        
-        # Execute the cleaned query
         result = db.run(cleaned_sql_query)
-        
-        print(f"Query result: {result}")  # Debug print
-        
-        # Generate response based on the query result with retry
         response = generate_response(cleaned_sql_query, result, question, history)
         
-        # Save the exchange to memory
         memory.save_context({"input": question}, {"output": response})
         
         return response
     except Exception as e:
         error_trace = traceback.format_exc()
         print(f"Error in get_response: {str(e)}\n{error_trace}")
-        return f"I apologize, but an error occurred while processing your request. Here's some technical information that might help diagnose the issue: {str(e)}"
+        return f"An error occurred: {str(e)}"
 
 def main():
     """Main function to run the chatbot."""
